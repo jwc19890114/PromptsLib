@@ -1,0 +1,16 @@
+:root {
+  color-scheme: dark;
+  background: #05060a;
+  color: #e5edff;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: #05060a;
+}

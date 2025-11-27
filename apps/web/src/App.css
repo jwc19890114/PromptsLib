@@ -1,0 +1,42 @@
+.web-app {
+  max-width: 960px;
+  margin: 0 auto;
+  padding: 32px;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.composer textarea {
+  width: 100%;
+  min-height: 160px;
+  padding: 16px;
+  font-size: 1rem;
+  border-radius: 8px;
+  border: 1px solid #d0d7de;
+}
+
+button {
+  margin-top: 12px;
+  padding: 10px 20px;
+  border-radius: 999px;
+  border: none;
+  background: #0ea5e9;
+  color: #fff;
+  cursor: pointer;
+}
+
+ul {
+  list-style: none;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+li {
+  border: 1px solid #e2e8f0;
+  padding: 12px;
+  border-radius: 8px;
+  background: #fff;
+}

@@ -1,0 +1,14 @@
+﻿# Node
+node_modules/
+apps/*/node_modules/
+dist/
+apps/*/dist/
+*.log
+
+# Rust
+/target
+apps/desktop/src-tauri/target/
+
+# VS Code / OS
+.vscode/
+.DS_Store

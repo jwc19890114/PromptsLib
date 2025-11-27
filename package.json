@@ -1,0 +1,13 @@
+{
+  "name": "promptlab",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/desktop",
+    "apps/web"
+  ],
+  "scripts": {
+    "dev:web": "npm run dev --workspace apps/web",
+    "dev:desktop": "npm run tauri:dev --workspace apps/desktop"
+  }
+}
