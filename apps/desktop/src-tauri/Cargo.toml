@@ -9,6 +9,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2.0.0-rc.10", features = ["tray-icon"] }
 tauri-plugin-shell = { version = "2.0.0-rc.0" }
+tauri-plugin-single-instance = { version = "2.0.0-rc.0" }
+tauri-plugin-dialog = { version = "2.0.0-rc.0" }
 chrono = { version = "0.4", features = ["serde"] }
 csv = "1"
 arboard = "3"

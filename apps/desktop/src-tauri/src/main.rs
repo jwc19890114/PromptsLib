@@ -14,7 +14,12 @@ use promptlab_core::analysis::{summarize_prompt_with_vocab, PromptAnalysis};
 use promptlab_core::storage::{Analysis, NewAnalysis, NewPrompt, Prompt, Storage, UpdatePrompt};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tauri::{tray::TrayIconBuilder, Builder, Manager, State, WindowEvent};
+use tauri::{
+  tray::{MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent},
+  Builder, Manager, State, WindowEvent,
+};
+use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+use tauri_plugin_single_instance::init as single_instance;
 
 struct AppState {
   storage: Storage,
@@ -331,6 +336,13 @@ fn remove_vocabulary_entry(state: State<AppState>, term: String) -> Result<Vec<S
 fn main() {
   Builder::default()
     .plugin(tauri_plugin_shell::init())
+    .plugin(tauri_plugin_dialog::init())
+    .plugin(single_instance(|app, _argv, _cwd| {
+      if let Some(window) = app.get_webview_window("main") {
+        let _ = window.show();
+        let _ = window.set_focus();
+      }
+    }))
     .on_window_event(|window, event| {
       if let WindowEvent::CloseRequested { api, .. } = event {
         // Hide to tray instead of quitting.
@@ -362,14 +374,30 @@ fn main() {
         vocabulary,
       });
 
-      let _tray = TrayIconBuilder::new()
-        .on_tray_icon_event(|tray, event| {
-          if let tauri::tray::TrayIconEvent::Click { .. } = event {
-            if let Some(window) = tray.app_handle().get_webview_window("main") {
-              let _ = window.show();
-              let _ = window.set_focus();
+      let _tray: TrayIcon = TrayIconBuilder::new()
+        .on_tray_icon_event(|tray, event| match event {
+          TrayIconEvent::Click { button, .. } => {
+            if button == MouseButton::Left {
+              if let Some(window) = tray.app_handle().get_webview_window("main") {
+                let _ = window.show();
+                let _ = window.set_focus();
+              }
+            } else if button == MouseButton::Right {
+              let app_handle = tray.app_handle().clone();
+              app_handle
+                .dialog()
+                .message("确定要退出 PromptLab 吗？")
+                .title("退出应用")
+                .kind(MessageDialogKind::Warning)
+                .buttons(MessageDialogButtons::OkCancel)
+                .show(move |ok| {
+                  if ok {
+                    app_handle.exit(0);
+                  }
+                });
             }
           }
+          _ => {}
         })
         .build(app)?;
 
