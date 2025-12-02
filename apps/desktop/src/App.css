@@ -53,8 +53,8 @@
 
 .workspace {
   display: grid;
-  grid-template-columns: minmax(0, 2fr) minmax(0, 2fr) minmax(0, 1.2fr);
-  gap: 16px;
+  grid-template-columns: minmax(0, 1.6fr) minmax(0, 1.4fr) minmax(0, 1fr);
+  gap: 14px;
 }
 
 .panel {
@@ -89,7 +89,7 @@
   padding: 16px;
   resize: none;
   font-size: 0.95rem;
-  min-height: 240px;
+  min-height: 120px;
 }
 
 .editor textarea:focus {
@@ -145,6 +145,8 @@ button.ghost.danger:disabled {
   padding: 16px;
   border: 1px solid #1f2333;
   white-space: pre-wrap;
+  max-height: 200px;
+  overflow: auto;
 }
 
 .analysis-controls {
@@ -192,6 +194,161 @@ button.ghost.danger:disabled {
   text-transform: uppercase;
   letter-spacing: 0.1em;
   color: #93c5fd;
+}
+
+.star-badge {
+  display: inline-block;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: #1f2333;
+  color: #fbbf24;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+
+.star-badge.small {
+  font-size: 0.75rem;
+  padding: 2px 8px;
+}
+
+.quality-block {
+  border: 1px solid #1f2333;
+  border-radius: 10px;
+  padding: 10px;
+  background: #0c0e16;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.quality-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.quality-score {
+  font-size: 0.85rem;
+  color: #94a3b8;
+}
+
+.quality-reason {
+  margin: 0;
+  font-size: 0.85rem;
+  color: #cbd5e1;
+}
+
+.quality-suggestions {
+  margin: 0;
+  padding-left: 18px;
+  color: #94a3b8;
+  font-size: 0.84rem;
+  display: grid;
+  gap: 2px;
+}
+
+.quality-suggestions li {
+  list-style: disc;
+}
+
+.history-title-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.history-actions-inline {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.label-chips {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.chip {
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 0.72rem;
+  border: 1px solid #1f2333;
+}
+
+.chip-good {
+  background: rgba(34, 197, 94, 0.12);
+  color: #34d399;
+  border-color: rgba(34, 197, 94, 0.3);
+}
+
+.chip-bad {
+  background: rgba(248, 113, 113, 0.12);
+  color: #f87171;
+  border-color: rgba(248, 113, 113, 0.3);
+}
+
+.chip-neutral {
+  background: #0c0e16;
+  color: #94a3b8;
+}
+
+.star-toggle {
+  background: transparent;
+  border: 1px solid #1f2333;
+  color: #fbbf24;
+  padding: 4px 8px;
+  border-radius: 6px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.star-toggle.active {
+  background: #fbbf24;
+  color: #0b0c12;
+  border-color: #fbbf24;
+}
+
+.star-control {
+  display: flex;
+  gap: 4px;
+}
+
+.label-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.label-buttons {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.chip-button {
+  border: 1px solid #1f2333;
+  background: transparent;
+  color: #e5edff;
+  padding: 6px 10px;
+  border-radius: 8px;
+}
+
+.chip-button.active {
+  background: #2563eb;
+  border-color: #2563eb;
+}
+
+.label-controls textarea {
+  background: #05060a;
+  border: 1px solid #1f2333;
+  border-radius: 8px;
+  color: #f8fafc;
+  padding: 8px;
+  font-family: inherit;
+  resize: vertical;
 }
 
 .meta-line {
@@ -266,6 +423,8 @@ button.ghost.danger:disabled {
 .history-actions {
   display: flex;
   gap: 8px;
+  flex-wrap: wrap;
+  align-items: center;
 }
 
 .analysis-log {
@@ -287,7 +446,7 @@ button.ghost.danger:disabled {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  max-height: 220px;
+  max-height: 200px;
   overflow-y: auto;
 }
 
@@ -433,6 +592,43 @@ button.ghost.danger:disabled {
   border-radius: 8px;
   color: #f8fafc;
   padding: 6px 8px;
+  font-family: inherit;
+  font-size: 0.9rem;
+}
+
+.page-size select {
+  background: #05060a;
+  border: 1px solid #1f2333;
+  border-radius: 8px;
+  color: #f8fafc;
+  padding: 6px 8px;
+  font-family: inherit;
+  font-size: 0.9rem;
+}
+
+.settings-block {
+  margin-top: 24px;
+  border-top: 1px solid #1f2333;
+  padding-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.settings-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.settings-row input {
+  width: 140px;
+  background: #05060a;
+  border: 1px solid #1f2333;
+  border-radius: 8px;
+  color: #f8fafc;
+  padding: 8px 10px;
   font-family: inherit;
   font-size: 0.9rem;
 }

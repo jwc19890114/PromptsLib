@@ -2,7 +2,7 @@
 
 use std::{
   fs::OpenOptions,
-  io::Write,
+  io::{Read, Write},
   path::{Path, PathBuf},
   sync::{Arc, Mutex},
   thread,
@@ -10,9 +10,11 @@ use std::{
 };
 
 use chrono::Local;
+use reqwest::blocking::Client;
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use promptlab_core::analysis::{summarize_prompt_with_vocab, PromptAnalysis};
 use promptlab_core::storage::{Analysis, NewAnalysis, NewPrompt, Prompt, Storage, UpdatePrompt};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::{
   tray::{MouseButton, TrayIcon, TrayIconBuilder, TrayIconEvent},
@@ -27,6 +29,38 @@ struct AppState {
   export_dir: PathBuf,
   vocabulary_path: PathBuf,
   vocabulary: Arc<Mutex<Vec<String>>>,
+  http_client: Client,
+  dashscope_key: Option<String>,
+  dashscope_base: String,
+  prompt_conf_threshold: Arc<Mutex<f64>>,
+  optimize_interval: Arc<Mutex<usize>>,
+  optimize_counter: Arc<Mutex<usize>>,
+}
+
+#[derive(Clone)]
+struct QwenCtx {
+  client: Client,
+  api_key: Option<String>,
+  base_url: String,
+  log_path: PathBuf,
+  prompt_conf_threshold: Arc<Mutex<f64>>,
+  optimize_interval: Arc<Mutex<usize>>,
+  optimize_counter: Arc<Mutex<usize>>,
+}
+
+#[derive(Deserialize)]
+struct QwenChoiceMessage {
+  content: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct QwenChoice {
+  message: QwenChoiceMessage,
+}
+
+#[derive(Deserialize)]
+struct QwenResponse {
+  choices: Vec<QwenChoice>,
 }
 
 impl AppState {
@@ -44,6 +78,66 @@ fn append_log(path: &PathBuf, message: &str) -> std::io::Result<()> {
   let mut file = OpenOptions::new().create(true).append(true).open(path)?;
   writeln!(file, "[{}] {message}", Local::now().format("%Y-%m-%d %H:%M:%S"))?;
   Ok(())
+}
+
+fn call_qwen_chat(qwen: &QwenCtx, messages: Vec<Value>, model: &str, max_tokens: u32) -> Result<Value, String> {
+  let api_key = qwen
+    .api_key
+    .as_ref()
+    .ok_or_else(|| "DASHSCOPE_API_KEY missing".to_string())?;
+  let url = format!("{}/chat/completions", qwen.base_url.trim_end_matches('/'));
+
+  let mut headers = HeaderMap::new();
+  headers.insert(
+    AUTHORIZATION,
+    HeaderValue::from_str(&format!("Bearer {}", api_key)).map_err(|e| e.to_string())?,
+  );
+  headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+
+  let payload = json!({
+    "model": model,
+    "messages": messages,
+    "max_tokens": max_tokens,
+    "temperature": 0.2,
+    "response_format": { "type": "json_object" }
+  });
+
+  let resp = qwen
+    .client
+    .post(url)
+    .headers(headers)
+    .json(&payload)
+    .send()
+    .map_err(|e| e.to_string())?
+    .error_for_status()
+    .map_err(|e| e.to_string())?;
+
+  let parsed: QwenResponse = resp.json().map_err(|e| e.to_string())?;
+  let content = parsed
+    .choices
+    .get(0)
+    .and_then(|c| c.message.content.as_ref())
+    .ok_or_else(|| "empty qwen response".to_string())?;
+  serde_json::from_str(content).map_err(|e| e.to_string())
+}
+
+fn classify_prompt_with_qwen(qwen: &QwenCtx, text: &str) -> Option<(bool, f64)> {
+  let system = "判断输入是否为大模型提示词（prompt）。Prompt 特征：指令/角色/格式要求/步骤/输出约束/占位符。非 prompt：叙事、论文、新闻、无指令。只输出 JSON: {\"is_prompt\": bool, \"confidence\": 0-1}. 示例：长篇论文段落 -> false；“请你扮演产品经理，输出PRD模板” -> true。";
+  let messages = vec![
+    json!({"role": "system", "content": system}),
+    json!({"role": "user", "content": text}),
+  ];
+  match call_qwen_chat(qwen, messages, "qwen-max", 200) {
+    Ok(value) => {
+      let is_prompt = value.get("is_prompt").and_then(|v| v.as_bool());
+      let confidence = value.get("confidence").and_then(|v| v.as_f64()).unwrap_or(0.0);
+      is_prompt.map(|p| (p, confidence))
+    }
+    Err(err) => {
+      let _ = append_log(&qwen.log_path, &format!("qwen classify failed: {err}"));
+      None
+    }
+  }
 }
 
 #[derive(Debug, Deserialize)]
@@ -217,7 +311,8 @@ fn latest_analysis(state: State<AppState>, prompt_id: String) -> Result<Option<A
 }
 
 #[tauri::command]
-fn export_prompts_csv(state: State<AppState>, target_path: Option<String>) -> Result<String, String> {
+fn export_prompts_csv(state: State<AppState>, #[allow(non_snake_case)] targetPath: Option<String>) -> Result<String, String> {
+  let target_path = targetPath;
   let file_path = if let Some(custom_path) = target_path {
     let path = PathBuf::from(custom_path);
     if let Some(parent) = path.parent() {
@@ -295,6 +390,101 @@ fn export_prompts_csv(state: State<AppState>, target_path: Option<String>) -> Re
 }
 
 #[tauri::command]
+fn import_prompts_csv(state: State<AppState>, path: String) -> Result<usize, String> {
+  let path = path;
+  let mut file = std::fs::File::open(&path).map_err(|e| e.to_string())?;
+  let mut data = String::new();
+  file.read_to_string(&mut data).map_err(|e| e.to_string())?;
+
+  let mut reader = csv::Reader::from_reader(data.as_bytes());
+  let headers = reader
+    .headers()
+    .map_err(|e| e.to_string())?
+    .iter()
+    .map(|h| h.to_string())
+    .collect::<Vec<_>>();
+  let idx = |name: &str| headers.iter().position(|h| h == name);
+
+  let mut imported = 0usize;
+  for result in reader.records() {
+    let record = result.map_err(|e| e.to_string())?;
+    let body = idx("body")
+      .and_then(|i| record.get(i))
+      .map(|s| s.trim().to_string())
+      .unwrap_or_default();
+    if body.is_empty() {
+      continue;
+    }
+    if let Ok(Some(_)) = state.storage.find_prompt_by_body(&body) {
+      continue;
+    }
+
+    let title = idx("title")
+      .and_then(|i| record.get(i))
+      .map(|s| s.to_string())
+      .unwrap_or_else(|| derive_title(&body));
+    let language = idx("language").and_then(|i| record.get(i)).map(|s| s.to_string());
+    let model_hint = idx("model_hint").and_then(|i| record.get(i)).map(|s| s.to_string());
+    let metadata_raw = idx("metadata").and_then(|i| record.get(i)).unwrap_or("");
+    let metadata = serde_json::from_str::<Value>(metadata_raw).unwrap_or(Value::Null);
+
+    let mut new_prompt = NewPrompt::new(title, body.clone());
+    new_prompt.language = language;
+    new_prompt.model_hint = model_hint;
+    new_prompt.metadata = metadata;
+
+    let prompt = match state.storage.create_prompt(new_prompt) {
+      Ok(p) => p,
+      Err(err) => {
+        let _ = append_log(&state.log_path, &format!("import prompt failed: {err}"));
+        continue;
+      }
+    };
+
+    let summary = idx("latest_summary")
+      .and_then(|i| record.get(i))
+      .map(|s| s.trim().to_string())
+      .unwrap_or_default();
+    let tags_raw = idx("latest_tags")
+      .and_then(|i| record.get(i))
+      .map(|s| s.to_string())
+      .unwrap_or_default();
+    let tags: Vec<String> = if tags_raw.is_empty() {
+      Vec::new()
+    } else {
+      tags_raw
+        .split('|')
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_string())
+        .collect()
+    };
+    let classification_raw = idx("classification")
+      .and_then(|i| record.get(i))
+      .map(|s| s.to_string())
+      .unwrap_or_else(|| "null".into());
+    let classification: Value = serde_json::from_str(&classification_raw).unwrap_or(Value::Null);
+
+    if !summary.is_empty() || !tags.is_empty() || !classification.is_null() {
+      let new_analysis = NewAnalysis {
+        prompt_id: prompt.id.clone(),
+        summary: if summary.is_empty() { "Imported".into() } else { summary },
+        tags,
+        classification,
+        qwen_model: None,
+      };
+      if let Err(err) = state.storage.create_analysis(new_analysis) {
+        let _ = append_log(&state.log_path, &format!("import analysis failed: {err}"));
+      }
+    }
+
+    imported += 1;
+  }
+
+  Ok(imported)
+}
+
+#[tauri::command]
 fn list_vocabulary(state: State<AppState>) -> Vec<String> {
   let mut vocab = state.vocabulary.lock().unwrap().clone();
   vocab.sort();
@@ -365,6 +555,24 @@ fn main() {
       let export_dir = data_dir.join("exports");
       let vocabulary_path = data_dir.join("vocabulary.json");
       let vocabulary = Arc::new(Mutex::new(load_vocabulary(&vocabulary_path)));
+      let dashscope_key = std::env::var("DASHSCOPE_API_KEY").ok();
+      let dashscope_base =
+        std::env::var("DASHSCOPE_BASE_URL").unwrap_or_else(|_| "https://dashscope.aliyuncs.com/compatible-mode/v1".to_string());
+      let prompt_conf_threshold_val = std::env::var("QWEN_PROMPT_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.1);
+      let prompt_conf_threshold = Arc::new(Mutex::new(prompt_conf_threshold_val));
+      let optimize_interval_val = std::env::var("QWEN_OPTIMIZE_INTERVAL")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(20);
+      let optimize_interval = Arc::new(Mutex::new(optimize_interval_val));
+      let optimize_counter = Arc::new(Mutex::new(0usize));
+      let http_client = Client::builder()
+        .timeout(Duration::from_secs(12))
+        .build()
+        .expect("http client");
 
       app.manage(AppState {
         storage,
@@ -372,6 +580,12 @@ fn main() {
         export_dir,
         vocabulary_path,
         vocabulary,
+        http_client,
+        dashscope_key,
+        dashscope_base,
+        prompt_conf_threshold,
+        optimize_interval,
+        optimize_counter,
       });
 
       let _tray: TrayIcon = TrayIconBuilder::new()
@@ -418,17 +632,33 @@ fn main() {
       export_prompts_csv,
       list_vocabulary,
       add_vocabulary_entry,
-      remove_vocabulary_entry
+      remove_vocabulary_entry,
+      import_prompts_csv,
+      set_prompt_threshold,
+      get_prompt_threshold,
+      set_optimize_interval,
+      get_optimize_interval,
+      optimize_threshold
     ])
     .run(tauri::generate_context!())
     .expect("error while running PromptLab desktop app");
 }
 
 fn start_clipboard_watcher(app_handle: tauri::AppHandle) {
-  let state = app_handle.state::<AppState>();
-  let storage = state.storage.clone();
-  let vocab = state.vocabulary.clone();
-  let log_path = state.log_path.clone();
+  let (storage, vocab, log_path, http_client, dashscope_key, dashscope_base, prompt_conf_threshold, optimize_interval, optimize_counter) = {
+    let state = app_handle.state::<AppState>();
+    (
+      state.storage.clone(),
+      state.vocabulary.clone(),
+      state.log_path.clone(),
+      state.http_client.clone(),
+      state.dashscope_key.clone(),
+      state.dashscope_base.clone(),
+      state.prompt_conf_threshold.clone(),
+      state.optimize_interval.clone(),
+      state.optimize_counter.clone(),
+    )
+  };
 
   thread::spawn(move || {
     let mut clipboard = match arboard::Clipboard::new() {
@@ -440,6 +670,16 @@ fn start_clipboard_watcher(app_handle: tauri::AppHandle) {
     };
 
     let mut last = String::new();
+  let qwen_state = QwenCtx {
+    client: http_client,
+    api_key: dashscope_key,
+    base_url: dashscope_base,
+    log_path: log_path.clone(),
+    prompt_conf_threshold,
+    optimize_interval,
+    optimize_counter,
+  };
+
     loop {
       thread::sleep(Duration::from_millis(3500));
       let Ok(text) = clipboard.get_text() else {
@@ -463,6 +703,48 @@ fn start_clipboard_watcher(app_handle: tauri::AppHandle) {
         }
       }
 
+  let mut qwen_pred = None;
+      match classify_prompt_with_qwen(&qwen_state, candidate) {
+        Some((flag, conf)) => {
+          qwen_pred = Some((flag, conf));
+          let threshold = *qwen_state
+            .prompt_conf_threshold
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+          if !flag && conf >= threshold {
+            let _ = append_log(&log_path, "qwen: skipped non-prompt clipboard text");
+            continue;
+          }
+          // auto-optimize threshold every N samples
+          if let Ok(mut counter) = qwen_state.optimize_counter.lock() {
+            *counter += 1;
+            let interval_guard = qwen_state
+              .optimize_interval
+              .lock()
+              .unwrap_or_else(|e| e.into_inner());
+            let interval_val = (*interval_guard).max(1);
+            if *counter >= interval_val {
+              *counter = 0;
+              if let Ok(suggestion) = optimize_threshold_internal(&storage) {
+                if let Ok(mut guard) = qwen_state.prompt_conf_threshold.lock() {
+                  *guard = suggestion.best_threshold;
+                }
+            let _ = append_log(
+              &log_path,
+              &format!(
+                "auto-optimized threshold -> {:.2} (acc {:.2}, total {})",
+                suggestion.best_threshold, suggestion.accuracy, suggestion.total
+              ),
+            );
+          }
+        }
+      }
+    }
+    None => {
+      // fallback: accept
+    }
+  }
+
       let vocab_guard = vocab.lock().unwrap().clone();
       let analysis = summarize_prompt_with_vocab(candidate, &vocab_guard);
       let title = derive_title(candidate);
@@ -480,7 +762,8 @@ fn start_clipboard_watcher(app_handle: tauri::AppHandle) {
           "theme": analysis.theme,
           "topic": analysis.topic,
           "role": analysis.role,
-          "targets": analysis.target_entities
+          "targets": analysis.target_entities,
+          "qwen_clipboard_pred": qwen_pred.map(|(flag, conf)| json!({"is_prompt": flag, "confidence": conf})),
         }),
       };
 
@@ -524,6 +807,106 @@ fn normalize_vocab_term(term: &str) -> String {
   } else {
     cleaned.to_string()
   }
+}
+
+#[tauri::command]
+fn set_prompt_threshold(state: State<AppState>, value: f64) -> Result<f64, String> {
+  if !value.is_finite() || value < 0.0 || value > 1.0 {
+    return Err("threshold must be between 0 and 1".into());
+  }
+  if let Ok(mut guard) = state.prompt_conf_threshold.lock() {
+    *guard = value;
+    return Ok(value);
+  }
+  Err("failed to set threshold".into())
+}
+
+#[tauri::command]
+fn get_prompt_threshold(state: State<AppState>) -> f64 {
+  *state
+    .prompt_conf_threshold
+    .lock()
+    .unwrap_or_else(|e| e.into_inner())
+}
+
+#[tauri::command]
+fn set_optimize_interval(state: State<AppState>, value: usize) -> Result<usize, String> {
+  let clamped = value.max(1).min(10_000);
+  if let Ok(mut guard) = state.optimize_interval.lock() {
+    *guard = clamped;
+    return Ok(clamped);
+  }
+  Err("failed to set interval".into())
+}
+
+#[tauri::command]
+fn get_optimize_interval(state: State<AppState>) -> usize {
+  *state
+    .optimize_interval
+    .lock()
+    .unwrap_or_else(|e| e.into_inner())
+}
+
+#[derive(Serialize)]
+struct ThresholdSuggestion {
+  best_threshold: f64,
+  accuracy: f64,
+  total: usize,
+  positive: usize,
+  negative: usize,
+}
+
+#[tauri::command]
+fn optimize_threshold(state: State<AppState>) -> Result<ThresholdSuggestion, String> {
+  let prompts = state.storage.list_prompts().map_err(|e| e.to_string())?;
+  compute_threshold(&prompts)
+}
+
+fn optimize_threshold_internal(storage: &Storage) -> Result<ThresholdSuggestion, String> {
+  let prompts = storage.list_prompts().map_err(|e| e.to_string())?;
+  compute_threshold(&prompts)
+}
+
+fn compute_threshold(prompts: &[Prompt]) -> Result<ThresholdSuggestion, String> {
+  let mut samples: Vec<(bool, bool, f64)> = Vec::new(); // (label, model_flag, model_conf)
+  for p in prompts {
+    let meta = &p.metadata;
+    let label = meta
+      .get("is_prompt_label")
+      .and_then(|v| v.as_bool())
+      .or_else(|| meta.get("is_prompt_label").and_then(|v| v.as_i64().map(|i| i != 0)));
+    let pred_obj = meta.get("qwen_clipboard_pred").and_then(|v| v.as_object());
+    let model_flag = pred_obj.and_then(|o| o.get("is_prompt")).and_then(|v| v.as_bool());
+    let model_conf = pred_obj.and_then(|o| o.get("confidence")).and_then(|v| v.as_f64());
+    if let (Some(lbl), Some(flag), Some(conf)) = (label, model_flag, model_conf) {
+      samples.push((lbl, flag, conf));
+    }
+  }
+  if samples.is_empty() {
+    return Err("no labeled samples with model prediction".into());
+  }
+  let thresholds = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0];
+  let mut best = (0.0, 0.0);
+  for t in thresholds {
+    let mut correct = 0usize;
+    for (lbl, flag, conf) in &samples {
+      let predicted_prompt = if !flag && *conf >= t { false } else { true };
+      if predicted_prompt == *lbl {
+        correct += 1;
+      }
+    }
+    let acc = correct as f64 / samples.len() as f64;
+    if acc > best.1 {
+      best = (t, acc);
+    }
+  }
+  Ok(ThresholdSuggestion {
+    best_threshold: best.0,
+    accuracy: best.1,
+    total: samples.len(),
+    positive: samples.iter().filter(|(l, _, _)| *l).count(),
+    negative: samples.iter().filter(|(l, _, _)| !*l).count(),
+  })
 }
 
 fn derive_title(body: &str) -> String {

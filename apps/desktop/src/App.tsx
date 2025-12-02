@@ -1,4 +1,4 @@
-﻿import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
 
@@ -30,6 +30,7 @@ type AnalysisClassification = {
   token_count?: number;
   length?: number;
   source?: string;
+  quality?: QualityInfo;
   [key: string]: unknown;
 };
 
@@ -43,10 +44,114 @@ type AnalysisRecord = {
   created_at: string;
 };
 
+type QualityInfo = {
+  star?: number;
+  score?: number;
+  tags: string[];
+  reason?: string;
+  suggestions?: string[];
+};
+
+type ParsedMeta = {
+  star?: unknown;
+  quality_score?: unknown;
+  quality_tags?: unknown;
+  quality_reason?: unknown;
+  is_prompt_label?: unknown;
+  label_reason?: unknown;
+  [key: string]: unknown;
+};
+
 const deriveTitle = (body: string) => {
   const firstLine = body.split("\n")[0]?.trim() ?? "";
   if (!firstLine) return "新建 Prompt";
   return firstLine.slice(0, 80);
+};
+
+const ensureArray = (value: unknown): string[] => {
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => (typeof item === "string" ? item.trim() : ""))
+      .filter(Boolean);
+  }
+  return [];
+};
+
+const coerceNumber = (value: unknown): number | undefined => {
+  const num = typeof value === "string" ? Number(value) : (value as number);
+  if (Number.isFinite(num)) return num as number;
+  return undefined;
+};
+
+const parseMetadata = (metadata: unknown): ParsedMeta => {
+  if (!metadata) return {};
+  if (typeof metadata === "string") {
+    try {
+      return JSON.parse(metadata) as ParsedMeta;
+    } catch {
+      return {};
+    }
+  }
+  if (typeof metadata === "object") {
+    return metadata as ParsedMeta;
+  }
+  return {};
+};
+
+const deriveQualityFromMeta = (metadata: unknown): QualityInfo | null => {
+  const meta = parseMetadata(metadata);
+  const star = coerceNumber(meta.star);
+  const score = coerceNumber(meta.quality_score);
+  const tags = ensureArray(meta.quality_tags);
+  const reason = typeof meta.quality_reason === "string" ? meta.quality_reason : undefined;
+  if (!star && !score && tags.length === 0 && !reason) return null;
+  return {
+    star,
+    score,
+    tags,
+    reason,
+    suggestions: [],
+  };
+};
+
+const deriveQualityFromClassification = (cls: AnalysisClassification | null): QualityInfo | null => {
+  if (!cls || typeof cls.quality !== "object" || cls.quality === null) return null;
+  const quality = cls.quality as Record<string, unknown>;
+  return {
+    star: coerceNumber(quality.star),
+    score: coerceNumber(quality.score),
+    tags: ensureArray(quality.tags),
+    reason: typeof quality.reason === "string" ? quality.reason : undefined,
+    suggestions: ensureArray(quality.suggestions),
+  };
+};
+
+const renderStars = (star?: number) => {
+  const value = Math.max(0, Math.min(5, Math.round(star ?? 0)));
+  return "★".repeat(value) + "☆".repeat(5 - value);
+};
+
+const deriveLabel = (metadata: unknown): { label: boolean | null; reason: string } => {
+  const meta = parseMetadata(metadata);
+  const raw = meta.is_prompt_label;
+  const reason = typeof meta.label_reason === "string" ? meta.label_reason : "";
+  if (raw == null) return { label: null, reason };
+  if (typeof raw === "boolean") return { label: raw, reason };
+  if (typeof raw === "number") return { label: raw !== 0, reason };
+  if (typeof raw === "string") {
+    const lowered = raw.toLowerCase();
+    if (["true", "yes", "1"].includes(lowered)) return { label: true, reason };
+    if (["false", "no", "0"].includes(lowered)) return { label: false, reason };
+  }
+  return { label: null, reason };
+};
+
+const upsertStarToMetadata = (metadata: unknown, star: number): ParsedMeta => {
+  const meta = parseMetadata(metadata);
+  return {
+    ...meta,
+    star,
+  };
 };
 
 export default function App() {
@@ -58,6 +163,7 @@ export default function App() {
   const [status, setStatus] = useState("就绪");
   const [isLoading, setIsLoading] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
+  const [importPath, setImportPath] = useState("");
   const [topicOverride, setTopicOverride] = useState("");
   const [tagInput, setTagInput] = useState("");
   const [vocabulary, setVocabulary] = useState<string[]>([]);
@@ -68,6 +174,14 @@ export default function App() {
   const [historyPage, setHistoryPage] = useState(1);
   const [pageSize, setPageSize] = useState(8);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [quality, setQuality] = useState<QualityInfo | null>(null);
+  const [minStar, setMinStar] = useState(0);
+  const [isStarUpdating, setIsStarUpdating] = useState<string | null>(null);
+  const [labelChoice, setLabelChoice] = useState<boolean | null>(null);
+  const [labelReason, setLabelReason] = useState("");
+  const [labelFilter, setLabelFilter] = useState<"all" | "prompt" | "non" | "unlabeled">("all");
+  const [optimizeInterval, setOptimizeInterval] = useState(20);
+  const [isOptUpdating, setIsOptUpdating] = useState(false);
 
   const tokenCount = useMemo(() => prompt.trim().split(/\s+/).filter(Boolean).length, [prompt]);
 
@@ -85,11 +199,23 @@ export default function App() {
   const currentTags = useMemo(() => parseTags(tagInput), [tagInput]);
   const displayTags = analysis ? (currentTags.length > 0 ? currentTags : analysis.suggestedTags) : [];
   const topicDisplay = topicOverride.trim() || analysis?.theme || analysis?.topic || "";
-  const totalPages = Math.max(1, Math.ceil(history.length / pageSize));
+  const filteredHistory = useMemo(() => {
+    return history.filter((item) => {
+      const quality = deriveQualityFromMeta(item.metadata);
+      const star = quality?.star ?? 0;
+      if (star < minStar) return false;
+      const labelInfo = deriveLabel(item.metadata);
+      if (labelFilter === "prompt") return labelInfo.label === true;
+      if (labelFilter === "non") return labelInfo.label === false;
+      if (labelFilter === "unlabeled") return labelInfo.label === null;
+      return true;
+    });
+  }, [history, minStar, labelFilter]);
+  const totalPages = Math.max(1, Math.ceil(filteredHistory.length / pageSize));
   const pagedHistory = useMemo(() => {
     const start = (historyPage - 1) * pageSize;
-    return history.slice(start, start + pageSize);
-  }, [history, historyPage]);
+    return filteredHistory.slice(start, start + pageSize);
+  }, [filteredHistory, historyPage, pageSize]);
 
   useEffect(() => {
     if (historyPage > totalPages) {
@@ -157,11 +283,25 @@ export default function App() {
     fetchVocabulary();
   }, []);
 
+  useEffect(() => {
+    const fetchInterval = async () => {
+      try {
+        const val = await invoke<number>("get_optimize_interval");
+        setOptimizeInterval(val);
+      } catch (error) {
+        console.error("get_optimize_interval", error);
+      }
+    };
+    fetchInterval();
+  }, []);
+
   const loadAnalyses = async (promptId: string) => {
     try {
       const items = await invoke<AnalysisRecord[]>("list_analyses", { promptId });
       console.log("list_analyses", promptId, "rows", items.length, items[0]);
       setAnalysisLog(items);
+      const promptRow = history.find((item) => item.id === promptId);
+      const qualityFromMeta = deriveQualityFromMeta(promptRow?.metadata);
       const latest = items[0] ?? null;
       if (latest) {
         const cls = (latest.classification || {}) as AnalysisClassification;
@@ -177,8 +317,11 @@ export default function App() {
           role: (cls as any).role ?? "",
           targetEntities: targets,
         });
+        const q = deriveQualityFromClassification(cls) || qualityFromMeta;
+        setQuality(q);
       } else {
         setAnalysis(null);
+        setQuality(qualityFromMeta || null);
       }
     } catch (error) {
       console.error("list_analyses", error);
@@ -193,8 +336,10 @@ export default function App() {
     setAnalysisLog([]);
     setTopicOverride("");
     setTagInput("");
-    setHistoryPage(1);
     setSelectedIds([]);
+    setQuality(null);
+    setLabelChoice(null);
+    setLabelReason("");
     setStatus("已切换到新草稿");
   };
 
@@ -256,9 +401,13 @@ export default function App() {
     setPrompt(entry.body);
     setActivePromptId(entry.id);
     setAnalysis(null);
+    setQuality(deriveQualityFromMeta(entry.metadata));
+    const labelInfo = deriveLabel(entry.metadata);
+    setLabelChoice(labelInfo.label);
+    setLabelReason(labelInfo.reason);
     setTopicOverride("");
     setTagInput("");
-    setHistoryPage(1);
+    
     setSelectedIds([]);
     setStatus(`已载入 ${new Date(entry.updated_at).toLocaleTimeString()}`);
     loadAnalyses(entry.id);
@@ -324,6 +473,73 @@ export default function App() {
     }
   };
 
+  const handleSetStar = async (entry: StoredPrompt, targetStar: number) => {
+    if (targetStar < 1 || targetStar > 5) return;
+    setIsStarUpdating(entry.id);
+    try {
+      const meta = upsertStarToMetadata(entry.metadata, targetStar);
+      const payload = {
+        title: entry.title,
+        body: entry.body,
+        language: entry.language,
+        model_hint: entry.model_hint,
+        metadata: meta,
+      };
+      const updated = await invoke<StoredPrompt>("update_prompt", { id: entry.id, payload });
+      setHistory((prev) =>
+        prev.map((item) => (item.id === entry.id ? { ...item, metadata: updated.metadata } : item)),
+      );
+      if (activePromptId === entry.id) {
+        setQuality(deriveQualityFromMeta(updated.metadata));
+      }
+      setStatus(`Star set to ${targetStar} for ${entry.title || "Untitled"}`);
+    } catch (error) {
+      console.error("toggle star", error);
+      setStatus("Star update failed");
+    } finally {
+      setIsStarUpdating(null);
+    }
+  };
+
+  const updatePromptMetadata = async (entry: StoredPrompt, metaPatch: Record<string, unknown>) => {
+    const currentMeta = parseMetadata(entry.metadata);
+    const nextMeta = { ...currentMeta, ...metaPatch };
+    const payload = {
+      title: entry.title,
+      body: entry.body,
+      language: entry.language,
+      model_hint: entry.model_hint,
+      metadata: nextMeta,
+    };
+    const updated = await invoke<StoredPrompt>("update_prompt", { id: entry.id, payload });
+    setHistory((prev) => prev.map((item) => (item.id === entry.id ? { ...item, metadata: updated.metadata } : item)));
+    if (activePromptId === entry.id) {
+      setQuality(deriveQualityFromMeta(updated.metadata));
+      const labelInfo = deriveLabel(updated.metadata);
+      setLabelChoice(labelInfo.label);
+      setLabelReason(labelInfo.reason);
+    }
+  };
+
+  const handleSetLabel = async (entry: StoredPrompt, label: boolean | null, reason: string) => {
+    setStatus("Saving label...");
+    try {
+      await updatePromptMetadata(entry, {
+        is_prompt_label: label,
+        label_reason: reason,
+      });
+      if (label === null) {
+        setLabelChoice(null);
+      } else {
+        setLabelChoice(label);
+      }
+      setStatus("Label saved");
+    } catch (error) {
+      console.error("set label", error);
+      setStatus("Label save failed");
+    }
+  };
+
   const handleAddVocabulary = async () => {
     if (!newVocab.trim()) return;
     setIsVocabBusy(true);
@@ -354,9 +570,9 @@ export default function App() {
     setIsExporting(true);
     setStatus("导出 CSV 中...");
     try {
-      const path = await invoke<string>("export_prompts_csv", {
-        target_path: exportPath.trim() || null,
-      });
+      const trimmed = exportPath.trim();
+      const args = trimmed ? { targetPath: trimmed } : {};
+      const path = await invoke<string>("export_prompts_csv", args);
       setLastExportPath(path);
       setStatus(`已导出到 ${path}`);
     } catch (error) {
@@ -368,12 +584,47 @@ export default function App() {
     }
   };
 
+  const handleImportCsv = async () => {
+    if (!importPath.trim()) {
+      setStatus("请输入导入路径");
+      return;
+    }
+    setStatus("导入中...");
+    try {
+      const count = await invoke<number>("import_prompts_csv", { path: importPath.trim() });
+      setStatus(`导入完成：${count} 条`);
+      await refreshHistory();
+    } catch (error) {
+      console.error(error);
+      const message = error instanceof Error ? error.message : "导入失败";
+      setStatus(message);
+    }
+  };
+
+  const handleSetOptimizeInterval = async () => {
+    if (!Number.isFinite(optimizeInterval) || optimizeInterval <= 0) {
+      setStatus("请输入有效的次数（>=1）");
+      return;
+    }
+    setIsOptUpdating(true);
+    try {
+      const val = await invoke<number>("set_optimize_interval", { value: optimizeInterval });
+      setOptimizeInterval(val);
+      setStatus(`已更新：每 ${val} 条判定自动优化阈值`);
+    } catch (error) {
+      console.error(error);
+      setStatus("更新优化次数失败");
+    } finally {
+      setIsOptUpdating(false);
+    }
+  };
+
   const clampPageSize = (value: number) => Math.min(100, Math.max(5, value));
 
   const handlePageSizeChange = (value: number) => {
     const next = clampPageSize(value);
     setPageSize(next);
-    setHistoryPage(1);
+    
     setSelectedIds([]);
   };
 
@@ -393,10 +644,10 @@ export default function App() {
 
   const handleDeleteSelected = async () => {
     if (selectedIds.length === 0) {
-      setStatus("δѡ��Ҫɾ���ļ�¼");
+      setStatus("δѡ**Ҫɾ***ļ*¼");
       return;
     }
-    setStatus("����ɾ����...");
+    setStatus("****ɾ****...");
     try {
       await Promise.all(selectedIds.map((id) => invoke<boolean>("delete_prompt", { id })));
       setHistory((prev) => prev.filter((item) => !selectedIds.includes(item.id)));
@@ -404,10 +655,10 @@ export default function App() {
         handleNewDraft();
       }
       setSelectedIds([]);
-      setStatus("����ɾ�����");
+      setStatus("****ɾ*****");
     } catch (error) {
       console.error(error);
-      setStatus("����ɾ��ʧ��");
+      setStatus("****ɾ**ʧ**");
     }
   };
 
@@ -469,8 +720,8 @@ export default function App() {
 
         <section className="panel analysis">
           <div className="panel-head">
-            <h2>分析结果</h2>
-            <span>{analysis ? "最近执行" : "暂无结果"}</span>
+            <h2>Analysis</h2>
+            <span>{analysis ? "Ready" : "No result"}</span>
           </div>
 
           {analysis ? (
@@ -481,47 +732,120 @@ export default function App() {
                   <span key={tag}>{tag}</span>
                 ))}
               </div>
-              {analysis.role && analysis.role !== "空" && <div className="meta-line">角色设定：{analysis.role}</div>}
-              {topicDisplay && <div className="meta-line">主题：{topicDisplay}</div>}
-              {analysis.targetEntities.length > 0 && (
-                <div className="meta-line">对象：{analysis.targetEntities.join("、")}</div>
+              {quality && (
+                <div className="quality-block">
+                  <div className="quality-header">
+                    {typeof quality.star === "number" && quality.star > 0 && (
+                      <span className="star-badge">{renderStars(quality.star)}</span>
+                    )}
+                    {typeof quality.score === "number" && (
+                      <span className="quality-score">Score {quality.score.toFixed(2)}</span>
+                    )}
+                  </div>
+                  {quality.tags.length > 0 && (
+                    <div className="tag-shelf compact">
+                      {quality.tags.slice(0, 6).map((tag) => (
+                        <span key={tag}>{tag}</span>
+                      ))}
+                    </div>
+                  )}
+                  {quality.reason && <p className="quality-reason">{quality.reason}</p>}
+                  {quality.suggestions && quality.suggestions.length > 0 && (
+                    <ul className="quality-suggestions">
+                      {quality.suggestions.slice(0, 4).map((item) => (
+                        <li key={item}>{item}</li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
               )}
-              <div className="meta-line">提示词长度：{analysis.length} 字符</div>
+              {analysis.role && analysis.role.trim() !== "" && <div className="meta-line">Role: {analysis.role}</div>}
+              {topicDisplay && <div className="meta-line">Topic: {topicDisplay}</div>}
+              {analysis.targetEntities.length > 0 && (
+                <div className="meta-line">Targets: {analysis.targetEntities.join(', ')}</div>
+              )}
+              <div className="meta-line">Length: {analysis.length} chars</div>
               <div className="analysis-controls">
+                <div className="label-controls">
+                  <span>Manual label</span>
+                  <div className="label-buttons">
+                    <button
+                      type="button"
+                      className={`chip-button ${labelChoice === true ? "active" : ""}`}
+                      onClick={() => {
+                        if (activePromptId) {
+                          const entry = history.find((p) => p.id === activePromptId);
+                          if (entry) handleSetLabel(entry, true, labelReason);
+                        }
+                      }}
+                    >
+                      Prompt
+                    </button>
+                    <button
+                      type="button"
+                      className={`chip-button ${labelChoice === false ? "active" : ""}`}
+                      onClick={() => {
+                        if (activePromptId) {
+                          const entry = history.find((p) => p.id === activePromptId);
+                          if (entry) handleSetLabel(entry, false, labelReason);
+                        }
+                      }}
+                    >
+                      Not prompt
+                    </button>
+                    <button
+                      type="button"
+                      className="chip-button"
+                      onClick={() => {
+                        if (activePromptId) {
+                          const entry = history.find((p) => p.id === activePromptId);
+                          if (entry) handleSetLabel(entry, null, labelReason);
+                        }
+                      }}
+                    >
+                      Clear
+                    </button>
+                  </div>
+                  <textarea
+                    value={labelReason}
+                    onChange={(event) => setLabelReason(event.target.value)}
+                    placeholder="Reason / note"
+                    rows={2}
+                  />
+                </div>
                 <label>
-                  自定义主题
+                  Topic / scenario (override)
                   <input
                     value={topicOverride}
                     onChange={(event) => setTopicOverride(event.target.value)}
-                    placeholder="例如：B2B 邮件营销策略"
+                    placeholder="e.g., B2B email marketing recap"
                   />
                 </label>
                 <label>
-                  标签（逗号 / 空格分隔）
+                  Tags (comma / space separated)
                   <input
                     value={tagInput}
                     onChange={(event) => setTagInput(event.target.value)}
-                    placeholder="品牌, 运营, 邮件"
+                    placeholder="brand, marketing, email"
                   />
                 </label>
                 <div className="analysis-actions">
                   <button type="button" className="ghost" onClick={handleCommitAnalysis}>
-                    保存分析
+                    Save analysis
                   </button>
                 </div>
               </div>
             </>
           ) : (
-            <div className="placeholder">尚未执行本地分析</div>
+            <div className="placeholder">No local analysis yet</div>
           )}
-
           <div className="analysis-log">
             <div className="panel-head">
-              <h3>历史分析</h3>
+              <h3>Analysis history</h3>
               <span>{analysisLog.length}</span>
             </div>
             <ul>
-              {analysisLog.length === 0 && <li className="placeholder">暂无分析记录</li>}
+              {analysisLog.length === 0 && <li className="placeholder">No analysis records</li>}
               {analysisLog.map((item) => {
                 const targets = Array.isArray(item.classification?.targets)
                   ? (item.classification?.targets as string[]).filter(
@@ -532,10 +856,10 @@ export default function App() {
                   <li key={item.id}>
                     <div>
                       <strong>{new Date(item.created_at).toLocaleTimeString()}</strong>
-                      <span>{item.classification?.topic ?? "未识别"}</span>
+                      <span>{item.classification?.topic ?? "Unknown"}</span>
                     </div>
                     <code>{item.summary.slice(0, 120)}</code>
-                    {targets.length > 0 && <small className="meta-line">对象：{targets.join("、")}</small>}
+                    {targets.length > 0 && <small className="meta-line">Targets: {targets.join(", ")}</small>}
                     {item.tags.length > 0 && (
                       <div className="tag-shelf compact">
                         {item.tags.slice(0, 4).map((tag) => (
@@ -549,12 +873,13 @@ export default function App() {
             </ul>
           </div>
         </section>
+
         <section className="panel history">
           <div className="panel-head">
-            <h2>提示词仓库</h2>
+            <h2>Prompt Library</h2>
             <div className="history-actions">
               <label className="page-size">
-                每页显示
+                Page size
                 <input
                   type="number"
                   min={5}
@@ -563,38 +888,100 @@ export default function App() {
                   onChange={(event) => handlePageSizeChange(Number(event.target.value) || pageSize)}
                 />
               </label>
+              <label className="page-size">
+                Star filter
+                <select value={minStar} onChange={(event) => setMinStar(Number(event.target.value))}>
+                  <option value={0}>All</option>
+                  <option value={3}>3+ stars</option>
+                  <option value={4}>4+ stars</option>
+                  <option value={5}>5 stars</option>
+                </select>
+              </label>
+              <label className="page-size">
+                Label filter
+                <select value={labelFilter} onChange={(event) => setLabelFilter(event.target.value as any)}>
+                  <option value="all">All</option>
+                  <option value="prompt">Labeled prompt</option>
+                  <option value="non">Labeled non-prompt</option>
+                  <option value="unlabeled">Unlabeled</option>
+                </select>
+              </label>
               <button type="button" className="ghost" onClick={handleSelectAllPage}>
-                当页全选
+                Select page
               </button>
               <button type="button" className="ghost danger" onClick={handleDeleteSelected} disabled={selectedIds.length === 0}>
-                删除选中
+                Delete selected
               </button>
               <button type="button" className="ghost" onClick={refreshHistory}>
-                刷新
+                Refresh
               </button>
             </div>
           </div>
           <ul>
-            {history.length === 0 && <li className="placeholder">暂无记录</li>}
-            {pagedHistory.map((entry) => (
-              <li
-                key={entry.id}
-                className={entry.id === activePromptId ? "active" : ""}
-                onClick={() => handleSelectHistory(entry)}
-              >
-                <label className="history-select">
-                  <input
-                    type="checkbox"
-                    checked={selectedIds.includes(entry.id)}
-                    onChange={() => handleToggleSelect(entry.id)}
-                    onClick={(event) => event.stopPropagation()}
-                  />
-                  <span>{new Date(entry.updated_at).toLocaleString()}</span>
-                </label>
-                <strong title={entry.title || "Untitled"}>{entry.title || "Untitled"}</strong>
-                <code>{entry.body.slice(0, 120)}</code>
-              </li>
-            ))}
+            {history.length === 0 && <li className="placeholder">No records</li>}
+            {pagedHistory.map((entry) => {
+              const qualityMeta = deriveQualityFromMeta(entry.metadata);
+              const starValue = qualityMeta?.star;
+              const qualityTags = qualityMeta?.tags ?? [];
+              return (
+                <li
+                  key={entry.id}
+                  className={entry.id === activePromptId ? "active" : ""}
+                  onClick={() => handleSelectHistory(entry)}
+                >
+                  <label className="history-select">
+                    <input
+                      type="checkbox"
+                      checked={selectedIds.includes(entry.id)}
+                      onChange={() => handleToggleSelect(entry.id)}
+                      onClick={(event) => event.stopPropagation()}
+                    />
+                    <span>{new Date(entry.updated_at).toLocaleString()}</span>
+                  </label>
+                  <div className="history-title-row">
+                    <strong title={entry.title || "Untitled"}>{entry.title || "Untitled"}</strong>
+                    <div className="history-actions-inline">
+                      {typeof starValue === "number" && starValue > 0 && (
+                        <span className="star-badge small">{renderStars(starValue)}</span>
+                      )}
+                      <div className="label-chips">
+                        {(() => {
+                          const labelInfo = deriveLabel(entry.metadata);
+                          if (labelInfo.label === true) return <span className="chip chip-good">Prompt</span>;
+                          if (labelInfo.label === false) return <span className="chip chip-bad">Not prompt</span>;
+                          return <span className="chip chip-neutral">Unlabeled</span>;
+                        })()}
+                      </div>
+                      <div className="star-control">
+                        {[1, 2, 3, 4, 5].map((level) => (
+                          <button
+                            key={level}
+                            type="button"
+                            className={`star-toggle ${starValue === level ? "active" : ""}`}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              handleSetStar(entry, level);
+                            }}
+                            disabled={isStarUpdating === entry.id}
+                            title={`Set ${level} star${level > 1 ? "s" : ""}`}
+                          >
+                            ★
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                  {qualityTags.length > 0 && (
+                    <div className="tag-shelf compact">
+                      {qualityTags.slice(0, 3).map((tag) => (
+                        <span key={tag}>{tag}</span>
+                      ))}
+                    </div>
+                  )}
+                  <code>{entry.body.slice(0, 120)}</code>
+                </li>
+              );
+            })}
           </ul>
           {history.length > pageSize && (
             <div className="pagination">
@@ -604,7 +991,7 @@ export default function App() {
                 onClick={() => setHistoryPage((page) => Math.max(1, page - 1))}
                 disabled={historyPage <= 1}
               >
-                上一页
+                Prev
               </button>
               <span>
                 {historyPage} / {totalPages}
@@ -615,53 +1002,65 @@ export default function App() {
                 onClick={() => setHistoryPage((page) => Math.min(totalPages, page + 1))}
                 disabled={historyPage >= totalPages}
               >
-                下一页
+                Next
               </button>
             </div>
           )}
-<div className="export-block">
+
+          <div className="export-block">
             <div className="panel-head">
-              <h3>数据导出</h3>
+              <h3>Export</h3>
             </div>
-            <p>一键导出所有提示词及最新分析，用于 Excel / Pandas 深入研究。</p>
+            <p>Export current prompts and analyses for Excel / Pandas review</p>
             <label>
-              保存路径（可选）
+              Export path (optional)
               <input
                 value={exportPath}
                 onChange={(event) => setExportPath(event.target.value)}
-                placeholder="留空则导出到默认目录"
+                placeholder="Leave empty to use default folder"
               />
             </label>
-            {lastExportPath && <small className="meta-line">上次导出：{lastExportPath}</small>}
+            {lastExportPath && <small className="meta-line">Last export: {lastExportPath}</small>}
             <button type="button" onClick={handleExportCsv} disabled={isExporting}>
-              {isExporting ? "导出中..." : "生成 CSV"}
+              {isExporting ? "Exporting..." : "Export CSV"}
+            </button>
+            <label>
+              Import path
+              <input
+                value={importPath}
+                onChange={(event) => setImportPath(event.target.value)}
+                placeholder="Path to CSV to import"
+              />
+            </label>
+            <button type="button" onClick={handleImportCsv} disabled={isExporting}>
+              Import CSV
             </button>
           </div>
 
           <div className="vocab-block">
             <div className="panel-head">
-              <h3>词表</h3>
+              <h3>Vocabulary</h3>
               <button type="button" className="ghost" onClick={fetchVocabulary} disabled={isVocabBusy}>
-                刷新
+                Refresh
               </button>
             </div>
-            <p>词表中的词将被优先识别为主题或标签，可随时增删。</p>
+            <p>Terms will be treated as keywords during analysis; remove to stop weighting.</p>
             <div className="vocab-add">
               <input
                 value={newVocab}
                 onChange={(event) => setNewVocab(event.target.value)}
-                placeholder="输入关键主题词"
+                placeholder="Add keyword"
               />
               <button
                 type="button"
                 onClick={handleAddVocabulary}
                 disabled={isVocabBusy || !newVocab.trim()}
               >
-                添加
+                Add
               </button>
             </div>
             <ul className="vocab-list">
-              {vocabulary.length === 0 && <li className="placeholder">暂无词条</li>}
+              {vocabulary.length === 0 && <li className="placeholder">No entries</li>}
               {vocabulary.map((term) => (
                 <li key={term}>
                   <span>{term}</span>
@@ -671,11 +1070,33 @@ export default function App() {
                     onClick={() => handleRemoveVocabulary(term)}
                     disabled={isVocabBusy}
                   >
-                    删除
+                    Remove
                   </button>
                 </li>
               ))}
             </ul>
+          </div>
+
+          <div className="settings-block">
+            <div className="panel-head">
+              <h3>Settings</h3>
+            </div>
+            <div className="settings-row">
+              <label className="page-size">
+                Auto-optimize interval (judgments)
+                <input
+                  type="number"
+                  min={1}
+                  max={10000}
+                  value={optimizeInterval}
+                  onChange={(event) => setOptimizeInterval(Number(event.target.value) || optimizeInterval)}
+                />
+              </label>
+              <button type="button" onClick={handleSetOptimizeInterval} disabled={isOptUpdating}>
+                Apply
+              </button>
+              <small className="meta-line">Default 20; adjustable</small>
+            </div>
           </div>
         </section>
       </main>
